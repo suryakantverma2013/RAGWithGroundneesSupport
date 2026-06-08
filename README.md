@@ -132,37 +132,42 @@ them to `.env`. Tracing is fully opt-in — the scripts run identically without 
 
 ## Running the scripts
 
-The normal flow is **two steps**: ingest a PDF, then query it.
+A clean **three-step linear sequence**: create the collection, ingest a PDF,
+then query it.
 
 ```
-   (optional) Milvus_Collection_With_Fields.py   ── illustrative schema demo
+   1. Milvus_Collection_With_Fields.py  ──►  creates the "hybrid_rag_docs" schema
                               │
-   1. ingest_pdf.py  ─────────┴──►  populates the "hybrid_rag_docs" collection
+   2. ingest_pdf.py  ─────────┴──►  populates it (dense embeddings + BM25)
                               │
-   2. haystack_milvus_hybrid_rag.py  ──►  queries it + evaluates groundedness
+   3. haystack_milvus_hybrid_rag.py  ──►  queries it + evaluates groundedness
 ```
 
-> The query script hard-codes the collection name **`hybrid_rag_docs`**, so
-> ingest into that collection for the demo to work out of the box.
+> The query script hard-codes the collection name **`hybrid_rag_docs`**, so all
+> three steps use that collection for the demo to work out of the box.
 
-### Step 1 *(optional / educational)* — `Milvus_Collection_With_Fields.py`
+### Step 1 — `Milvus_Collection_With_Fields.py` (create the collection)
 
-A small, self-contained script that builds a hybrid Milvus collection schema
-**directly with the native `pymilvus` client** — primary key, an analyzer-enabled
-`text` field, a dense `FLOAT_VECTOR` (1536-dim), a `SPARSE_FLOAT_VECTOR`, and a
-BM25 `Function` that auto-populates the sparse field. It's useful for
-understanding exactly what a hybrid (dense + BM25) schema looks like.
+Builds the hybrid Milvus collection schema **directly with the native `pymilvus`
+client**, so the layout is explicit and inspectable: a string `VARCHAR` primary
+key (`auto_id=False`), an analyzer-enabled `text` field, a dense
+`vector FLOAT_VECTOR(1536)`, a `sparse_vector SPARSE_FLOAT_VECTOR`, a dynamic
+field for metadata, and a BM25 `Function` that auto-populates the sparse field.
+The field names, types, and analyzer settings **match exactly** what Haystack's
+`MilvusDocumentStore` expects, so Step 2 attaches to this collection and writes
+to it without a schema conflict.
 
 ```bash
-uv run python Milvus_Collection_With_Fields.py
+uv run python Milvus_Collection_With_Fields.py            # create if absent
+uv run python Milvus_Collection_With_Fields.py --drop-old # recreate from scratch
 ```
 
-> ⚠️ **You do not need to run this for the demo.** `ingest_pdf.py` creates and
-> owns its own collection through Haystack's `MilvusDocumentStore`. The two use
-> **different dense-field names** (`dense_vector` here vs. `vector` in the
-> ingestion path), so **don't point both at the same collection name** — pick the
-> Haystack-managed flow (Steps 2–3) for the working pipeline, and treat this
-> script as a standalone reference.
+Re-running is a safe no-op when the collection already exists (it is not dropped
+unless `--drop-old` is given).
+
+> **Optional:** `ingest_pdf.py` (Step 2) will auto-create the collection with the
+> identical schema if you skip Step 1. Running Step 1 first just gives you
+> explicit control over (and a clear view of) the schema and indexes.
 
 ### Step 2 — `ingest_pdf.py` (build the index)
 
@@ -265,7 +270,7 @@ question can't run up unbounded cost or latency.
 |---|---|
 | `haystack_milvus_hybrid_rag.py` | **Query pipeline** — analyzer, hybrid retrieval, feedback loop, generation, evaluation. |
 | `ingest_pdf.py` | **Ingestion** — PDF → chunks → embeddings → Milvus (dense + BM25). |
-| `Milvus_Collection_With_Fields.py` | Standalone reference: build a hybrid schema with native `pymilvus`. |
+| `Milvus_Collection_With_Fields.py` | **Step 1** — create the hybrid (dense + BM25) collection with native `pymilvus`. |
 | `langfuse_tracing.py` | Shared, opt-in Langfuse tracing setup. |
 | `logging_setup.py` | Shared logging — ns timestamps, rotating files under `logs/`, noise capping. |
 | `docker-compose.langfuse.yml` | Local Langfuse stack. |

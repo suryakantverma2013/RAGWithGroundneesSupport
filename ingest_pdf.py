@@ -349,9 +349,16 @@ def _build_store(
             BM25BuiltInFunction(
                 input_field_names="text",
                 output_field_names="sparse_vector",
+                # Keep this analyzer identical to Milvus_Collection_With_Fields.py
+                # and haystack_milvus_hybrid_rag.py so all three agree on
+                # tokenisation (applies only when THIS call creates the
+                # collection; when attaching to an existing one it is a no-op).
                 analyzer_params={
                     "tokenizer": "standard",
-                    "filter": ["lowercase"],
+                    "filter": [
+                        "lowercase",
+                        {"type": "stop", "stop_words": ["a", "an", "the", "is", "of"]},
+                    ],
                 },
                 enable_match=True,
             )
