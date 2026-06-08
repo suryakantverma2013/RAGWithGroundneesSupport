@@ -1,0 +1,34 @@
+services:
+  langfuse-server:
+    image: langfuse/langfuse:2
+    restart: unless-stopped
+    depends_on:
+      langfuse-db:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgresql://langfuse:langfuse@langfuse-db:5432/langfuse
+      NEXTAUTH_URL: http://localhost:3000
+      # IMPORTANT: Replace both values below with strong random strings (≥32 chars)
+      # Generate on Linux/Mac: openssl rand -hex 32
+      # Generate on Windows  : python -c "import secrets; print(secrets.token_hex(32))"
+      NEXTAUTH_SECRET: 23f97c9d883156eb293eb783894f661ee6d5b8eff7051d63380f5a03c43af511
+      SALT: c597280248202ed804c8454d50b81f21a8335f9950c1f68d8604dede6942d428
+      TELEMETRY_ENABLED: "false"
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "false"
+
+  langfuse-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: langfuse
+      POSTGRES_DB: langfuse
+    volumes:
+      - E:/LangfuseVolumes/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse -d langfuse"]
+      interval: 5s
+      timeout: 5s
+      retries: 10

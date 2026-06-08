@@ -1,0 +1,20 @@
+[project]
+name = "milvuswithhaystack"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "haystack-ai>=2.29.0",
+    "milvus-haystack>=0.0.18",
+    "openai>=2.40.0",
+    "pymilvus>=2.5.0,<3.0.0",
+    # PDF ingestion pipeline (ingest_pdf.py)
+    "docling>=2.0.0",          # PDF parsing: layout, tables (Markdown), images
+    "tiktoken>=0.7.0",         # token-accurate chunking aligned with the embedding model
+    "pillow>=10.0.0",          # image handling for Tesseract OCR
+    "pytesseract>=0.3.10",     # Tesseract OCR Python wrapper (binary required separately)
+    "langfuse>=2.0.0,<3.0.0",  # LLM observability — cost + token tracking per pipeline run
+    "langfuse-haystack<1.0",
+    "python-dotenv>=1.2.2",
+]
