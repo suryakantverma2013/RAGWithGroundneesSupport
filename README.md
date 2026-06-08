@@ -60,8 +60,8 @@ vector index (HNSW / cosine) **and** a sparse **BM25** index. At query time it:
 ### 1. Clone
 
 ```bash
-git clone https://github.com/suryakantverma2013/RAGWithGroundneesSupport.git
-cd RAGWithGroundneesSupport
+git clone https://github.com/suryakantverma2013/RAGWithGroundednessSupport.git
+cd RAGWithGroundednessSupport
 ```
 
 ### 2. Install dependencies
