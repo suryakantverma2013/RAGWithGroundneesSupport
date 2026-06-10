@@ -15,8 +15,8 @@ Why a custom span handler is needed
   default they produce plain SPANs with no model / token-usage / cost fields.
 * Langfuse tokenizes any input/output content attached to a GENERATION and
   lets that estimate OVERRIDE explicitly provided usage numbers.  Embedded
-  document payloads also blow the per-event size limit (215 docs x 1536-dim
-  embeddings ~ 7 MB), triggering truncation that destroys usage metadata.
+  document payloads also blow the per-event size limit (215 docs x 3072-dim
+  embeddings ~ 14 MB), triggering truncation that destroys usage metadata.
 
 The handler below records embedders as GENERATION spans carrying the exact
 OpenAI-reported token usage, withholds the raw payload (a compact summary
@@ -79,7 +79,7 @@ def enable_langfuse(trace_name: str) -> bool:
         """
         Caches component input/output locally (handle() reads it) but does
         NOT ship the raw payload to Langfuse.  Two reasons:
-          - documents with 1536-dim embeddings exceed Langfuse's event
+          - documents with 3072-dim embeddings exceed Langfuse's event
             size limit and would be truncated anyway;
           - on GENERATION spans, Langfuse tokenizes any input/output
             content it receives and lets that count OVERRIDE provided

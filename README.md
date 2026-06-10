@@ -1,8 +1,9 @@
 # RAG with Groundedness Support
 
 A **hybrid Retrieval-Augmented Generation** pipeline built on **Haystack 2.x** and
-**Milvus 2.5**, with **query-quality-driven branching** and a **grounded retrieval
-feedback loop**.
+**Milvus 2.5**, with **query-quality-driven branching**, a **grounded retrieval
+feedback loop**, and a **three-tier answering strategy** (semantic cache →
+grounded RAG → LLM fallback).
 
 Given a PDF, it parses and chunks the document (text, tables, and image OCR),
 embeds the chunks with OpenAI, and indexes them in Milvus using **both** a dense
@@ -20,6 +21,30 @@ vector index (HNSW / cosine) **and** a sparse **BM25** index. At query time it:
 4. **Generates** a grounded answer and **evaluates** it for *faithfulness* and
    *context relevance*.
 
+### Three tiers — every question gets a useful answer
+
+Around the grounded path above (Tier 1) sit two more tiers, all coordinated by
+`answer_question()`:
+
+- **Tier 0 — semantic cache.** *Before* retrieval, the question is matched (by
+  dense embedding) against a **separate** `qa_cache` Milvus collection of prior
+  LLM-fallback answers. A hit must clear a high similarity threshold **and** an
+  LLM gate that confirms the cached answer actually fits the new question (so a
+  near-paraphrase with different intent isn't served the wrong answer). A hit
+  short-circuits retrieval and generation entirely.
+- **Tier 2 — LLM fallback.** When retrieval can't surface relevant-enough
+  context (context relevance below threshold), the question is answered from the
+  model's own (parametric) knowledge with **no corpus context**. The answer is
+  flagged `source="model_knowledge"` (ungrounded by construction, so faithfulness
+  is not scored) and **written back to `qa_cache`** so a future similar question
+  hits Tier 0.
+
+The `qa_cache` collection is kept **physically separate** from the document
+collection on purpose: cached LLM answers are unverified, and blending them into
+document retrieval would let a hallucination be retrieved and cited as source
+material. `ingest_pdf.py` owns `hybrid_rag_docs` and never sees the cache; the
+query script owns `qa_cache` and never writes to `hybrid_rag_docs`.
+
 ---
 
 ## Architecture
@@ -33,11 +58,17 @@ vector index (HNSW / cosine) **and** a sparse **BM25** index. At query time it:
                                                                                   │
                                                                                   ▼
                          ┌─────────────────────────────────────────────────────────────┐
-  question ──► haystack_ │  query analyzer (refine / decompose)                          │
-              milvus_    │     → hybrid retrieval (per sub-query, merged)                │──► answer
-              hybrid_    │     → relevance feedback loop (retry if low)                  │  + metrics
-              rag.py     │     → generate → faithfulness + context-relevance eval        │
-                         └─────────────────────────────────────────────────────────────┘
+  question ──► haystack_ │  Tier 0  semantic cache lookup (+ LLM gate) ──── hit ───────► │──► answer
+              milvus_    │     │ miss                                                     │  (cached)
+              hybrid_    │  Tier 1  query analyzer → hybrid retrieval → feedback loop     │──► answer
+              rag.py     │     │ context relevance ≥ threshold → generate + evaluate      │  + metrics
+                         │     │ below threshold ↓                                        │
+                         │  Tier 2  LLM fallback (no context) → cache the answer ───────► │──► answer
+                         └─────────────────────────────────────────────────────────────┘  (model
+                                            │  writes back                                  knowledge)
+                                            ▼
+                                   Milvus collection "qa_cache"  ◄── Tier 0 reads from here
+                                   (separate; dense-only, COSINE)
 ```
 
 ---
@@ -151,7 +182,7 @@ then query it.
 Builds the hybrid Milvus collection schema **directly with the native `pymilvus`
 client**, so the layout is explicit and inspectable: a string `VARCHAR` primary
 key (`auto_id=False`), an analyzer-enabled `text` field, a dense
-`vector FLOAT_VECTOR(1536)`, a `sparse_vector SPARSE_FLOAT_VECTOR`, a dynamic
+`vector FLOAT_VECTOR(3072)`, a `sparse_vector SPARSE_FLOAT_VECTOR`, a dynamic
 field for metadata, and a BM25 `Function` that auto-populates the sparse field.
 The field names, types, and analyzer settings **match exactly** what Haystack's
 `MilvusDocumentStore` expects, so Step 2 attaches to this collection and writes
@@ -172,7 +203,7 @@ unless `--drop-old` is given).
 ### Step 2 — `ingest_pdf.py` (build the index)
 
 Parses a PDF, chunks it (structure-aware text + atomic tables + optional image
-OCR), embeds with `text-embedding-3-small`, and writes to Milvus with both the
+OCR), embeds with `text-embedding-3-large`, and writes to Milvus with both the
 dense and BM25 sparse indexes. Re-running on the same PDF **replaces** that
 document's chunks (idempotent), leaving other documents untouched.
 
@@ -206,9 +237,12 @@ uv run python ingest_pdf.py paper.pdf hybrid_rag_docs --log-dest console --log-l
 
 ### Step 3 — `haystack_milvus_hybrid_rag.py` (query + evaluate)
 
-Runs the query-analyzer → hybrid-retrieval → feedback-loop → generation pipeline
-against the populated collection, and prints a **RUN SUMMARY** with each answer
-plus faithfulness / context-relevance metrics.
+Runs the three-tier flow (cache → query-analyzer → hybrid-retrieval →
+feedback-loop → generation, with LLM fallback) against the populated collection,
+and prints a **RUN SUMMARY** with each answer, its **source** (`cache` / `rag` /
+`model_knowledge`), plus faithfulness / context-relevance metrics for grounded
+answers. The `qa_cache` collection is created automatically the first time a
+fallback answer is cached — no setup needed.
 
 ```bash
 # Ask your own question(s) — each positional arg is a separate query:
@@ -229,35 +263,52 @@ uv run python haystack_milvus_hybrid_rag.py --log-dest console --log-level INFO 
 | `QUERY` *(positional, repeatable)* | Question(s) to ask. None → built-in demo set. |
 | `--log-dest` / `--log-level` | `file` (default) or `console`; `INFO`/`DEBUG`/`WARN`. |
 
-Example console output for one query:
+Example console output for a **grounded (Tier 1)** query:
 
 ```
 Attempt 1/2 — query analysis: simple — 1 query(ies): ['aha moment in DeepSeek-R1']
-Attempt 1 retrieved 4 docs — context_relevance=1.000
+Attempt 1 retrieved 4 docs (merged from 1 query(ies)) — context_relevance=1.000
 Retrieval loop ended after 1 attempt(s) — reason=threshold_met, context_relevance=1.000
 [Q1] What is the 'aha moment' in DeepSeek-R1?
-Query analysis: simple — searched 1 query(ies) in 1 attempt(s) (stop: threshold_met): [...]
+Source: RAG — query analysis: simple — searched 1 query(ies) in 1 attempt(s) (stop: threshold_met): [...]
 Answer: ...
 Metrics: faithfulness=1.000  context_relevance=1.000  docs_retrieved=4  avg_retrieval_score=0.0163
+```
+
+A question the corpus can't answer falls back to the LLM and is cached
+(**Tier 2**); a later paraphrase is served from the cache (**Tier 0**):
+
+```
+# First time — corpus has nothing relevant → LLM fallback, answer cached:
+Context relevance 0.000 < 0.70 — the corpus can't answer this; falling back to the LLM ...
+Source: MODEL KNOWLEDGE — LLM fallback (no corpus context; best context_relevance=0.000 < 0.70); answer cached ...
+Metrics: (not applicable — answer is not grounded in the corpus)
+
+# Later, a reworded version of the same question — no LLM call, no retrieval:
+Cache HIT (sim=0.939) — reusing the answer cached for 'Who wrote the play Romeo and Juliet?'
+Source: CACHE — reused a prior LLM-fallback answer (similarity=0.939) cached for: '...'
 ```
 
 ---
 
 ## How the query-quality branching & feedback loop work
 
-The retrieval loop in `ask()` is bounded by independent stop conditions and
-**always terminates with an answer** (from the best-scoring attempt). The
-defaults live as module constants near the top of `haystack_milvus_hybrid_rag.py`:
+The retrieval loop in `retrieve_best_context()` is bounded by independent stop
+conditions and **always terminates with an answer** (from the best-scoring
+attempt); `answer_question()` then decides between grounding on that context
+(Tier 1) and falling back to the LLM (Tier 2). The defaults live as module
+constants near the top of `haystack_milvus_hybrid_rag.py`:
 
 | Constant | Default | Role |
 |---|---|---|
-| `RELEVANCE_THRESHOLD` | `0.7` | Success exit — stop once context relevance ≥ this. |
+| `RELEVANCE_THRESHOLD` | `0.7` | Success exit / Tier-1↔2 boundary — ground on the context once relevance ≥ this; below it, fall back to the LLM. |
 | `MAX_RETRIEVAL_ATTEMPTS` | `2` | Hard ceiling — original try + (N−1) refined retries. |
 | `MIN_GAIN` | `0.05` | Plateau exit — stop if a retry doesn't improve by this much. |
 | *(stable doc set)* | — | Stop if a retry returns the same chunks. |
 | `RETRIEVER_TOP_K` | `4` | Docs retrieved per sub-query. |
 | `MAX_CONTEXT_DOCS` | `8` | Cap on the merged context after fusing sub-queries. |
 | `MAX_SUBQUERIES` | `4` | Cap on sub-queries a complex decomposition may request. |
+| `CACHE_SIMILARITY_THRESHOLD` | `0.90` | Tier 0 — minimum question-embedding similarity (mapped COSINE, `[0,1]`) for a cached answer to be considered; an LLM gate then confirms reuse. |
 
 Most queries pass on the first attempt and never loop; the guards exist so a hard
 question can't run up unbounded cost or latency.
@@ -268,7 +319,7 @@ question can't run up unbounded cost or latency.
 
 | File | Purpose |
 |---|---|
-| `haystack_milvus_hybrid_rag.py` | **Query pipeline** — analyzer, hybrid retrieval, feedback loop, generation, evaluation. |
+| `haystack_milvus_hybrid_rag.py` | **Query pipeline** — three-tier answering (semantic cache, hybrid-retrieval + feedback loop + generation, LLM fallback), evaluation. |
 | `ingest_pdf.py` | **Ingestion** — PDF → chunks → embeddings → Milvus (dense + BM25). |
 | `Milvus_Collection_With_Fields.py` | **Step 1** — create the hybrid (dense + BM25) collection with native `pymilvus`. |
 | `langfuse_tracing.py` | Shared, opt-in Langfuse tracing setup. |
@@ -300,4 +351,9 @@ question can't run up unbounded cost or latency.
 - The collection name `hybrid_rag_docs` is hard-coded in the query script; the
   built-in demo questions target the **DeepSeek-R1** paper, so ingest that PDF (or
   edit the questions / your own queries) to match your corpus.
+- The query script also maintains a **second** collection, `qa_cache`
+  (`QA_CACHE_COLLECTION`), holding cached LLM-fallback answers. It is created
+  automatically on first use and **persists across runs** (never dropped). To
+  clear it, drop the collection — e.g.
+  `python -c "from pymilvus import MilvusClient; MilvusClient(uri='http://localhost:19530').drop_collection('qa_cache')"`.
 - `.env`, `.venv/`, and `logs/` are git-ignored.

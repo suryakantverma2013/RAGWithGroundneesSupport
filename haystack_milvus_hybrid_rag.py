@@ -189,6 +189,12 @@ os.environ.setdefault("OPENAI_TIMEOUT", "120")
 MILVUS_URI = os.environ.get("MILVUS_URI", "http://localhost:19530")
 COLLECTION_NAME = "hybrid_rag_docs"
 
+# Dense embedding model — MUST match what ingest_pdf.py wrote into the collection
+# (text-embedding-3-large → 3072-dim) and the dim declared in
+# Milvus_Collection_With_Fields.py.  Used by the document retriever AND both
+# qa_cache embedders (lookup + write) so they always share one vector space.
+EMBEDDING_MODEL = "text-embedding-3-large"
+
 # For Zilliz Cloud (fully-managed Milvus):
 # MILVUS_URI   = "https://<cluster>.api.gcp-us-west1.zillizcloud.com"
 # MILVUS_TOKEN = os.getenv("ZILLIZ_CLOUD_API_KEY", "")
@@ -475,7 +481,7 @@ query_analyzer_pipeline.connect("prompt_builder.prompt", "llm.messages")
 retrieval_pipeline = Pipeline()
 retrieval_pipeline.add_component(
     "text_embedder",
-    OpenAITextEmbedder(model="text-embedding-3-small"),
+    OpenAITextEmbedder(model=EMBEDDING_MODEL),
 )
 retrieval_pipeline.add_component(
     "retriever",
@@ -507,7 +513,7 @@ generation_pipeline.connect("prompt_builder.prompt", "llm.messages")
 cache_lookup_pipeline = Pipeline()
 cache_lookup_pipeline.add_component(
     "text_embedder",
-    OpenAITextEmbedder(model="text-embedding-3-small"),
+    OpenAITextEmbedder(model=EMBEDDING_MODEL),
 )
 cache_lookup_pipeline.add_component(
     "retriever",
@@ -553,7 +559,7 @@ fallback_pipeline.connect("prompt_builder.prompt", "llm.messages")
 cache_write_pipeline = Pipeline()
 cache_write_pipeline.add_component(
     "embedder",
-    OpenAIDocumentEmbedder(model="text-embedding-3-small", progress_bar=False),
+    OpenAIDocumentEmbedder(model=EMBEDDING_MODEL, progress_bar=False),
 )
 cache_write_pipeline.add_component(
     "writer",

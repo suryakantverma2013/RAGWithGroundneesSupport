@@ -158,12 +158,12 @@ Every `OpenAIDocumentEmbedder` call is now captured as a trace in Langfuse.
 ### What you see in the dashboard
 
 ```
-Trace: ingest_pdf  — $0.0023  — 4.1s
+Trace: ingest_pdf  — $0.0193  — 4.1s
   └── OpenAIDocumentEmbedder
-        model:         text-embedding-3-small
+        model:         text-embedding-3-large
         input_tokens:  14 832
         output_tokens: 0
-        cost:          $0.0023
+        cost:          $0.0193
         latency:       3.8s
         batch_size:    32
 ```

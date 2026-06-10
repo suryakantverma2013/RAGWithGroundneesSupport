@@ -8,7 +8,7 @@ Milvus's built-in BM25 function.
 
 Index design
 ------------
-  Dense  (HNSW / COSINE)           — OpenAI text-embedding-3-small, 1 536-dim
+  Dense  (HNSW / COSINE)           — OpenAI text-embedding-3-large, 3 072-dim
   Sparse (SPARSE_INVERTED_INDEX)   — Milvus BM25BuiltInFunction, server-side
 
 Chunk strategy
@@ -145,7 +145,7 @@ from milvus_haystack.function import BM25BuiltInFunction
 # ─────────────────────────────────────────────────────────────────────────────
 # Tuneable constants
 # ─────────────────────────────────────────────────────────────────────────────
-EMBEDDING_MODEL = "text-embedding-3-small"   # 1 536-dim, 8 191-token limit
+EMBEDDING_MODEL = "text-embedding-3-large"   # 3 072-dim, 8 191-token limit
 MAX_CHUNK_TOKENS = 512    # comfortably within the 8 191-token ceiling
 EMBED_BATCH_SIZE = 32     # chunks per OpenAI API call
 MIN_OCR_CHARS = 30        # discard OCR strings shorter than this (noise)

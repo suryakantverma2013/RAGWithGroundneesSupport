@@ -15,7 +15,7 @@ write to it without a schema conflict:
     id             VARCHAR  primary key, auto_id=False
                             ← Haystack writes string Document IDs (SHA-256 hex)
     text           VARCHAR  analyzer enabled — BM25 reads from this field
-    vector         FLOAT_VECTOR(1536)  OpenAI text-embedding-3-small (dense)
+    vector         FLOAT_VECTOR(3072)  OpenAI text-embedding-3-large (dense)
     sparse_vector  SPARSE_FLOAT_VECTOR  BM25 output (populated server-side)
     + dynamic field          all Document.meta keys (document_name,
                              page_numbers, chunk_type, …) — no need to predeclare
@@ -47,7 +47,7 @@ from pymilvus import DataType, Function, FunctionType, MilvusClient
 load_dotenv(Path(__file__).parent / ".env")
 
 COLLECTION_NAME = "hybrid_rag_docs"
-EMBEDDING_DIM = 1536  # OpenAI text-embedding-3-small
+EMBEDDING_DIM = 3072  # OpenAI text-embedding-3-large
 
 # Canonical BM25 analyzer — MUST stay identical to the analyzer_params passed to
 # BM25BuiltInFunction in ingest_pdf.py and haystack_milvus_hybrid_rag.py so all
