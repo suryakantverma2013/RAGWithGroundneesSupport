@@ -15,6 +15,28 @@ Runs hybrid retrieval + RAG against an existing Milvus collection.
                    once per (sub-)query; the retrieved docs are merged + deduped
                    → PromptBuilder → OpenAIChatGenerator (one answer per query)
 
+Each question is answered in three tiers (see answer_question):
+
+  Tier 0  Semantic cache — a SEPARATE 'qa_cache' Milvus collection holds prior
+          LLM-fallback answers, keyed by the question's dense embedding (COSINE).
+          A new question is matched against it (top-1, high-similarity gate); an
+          LLM then confirms the cached answer actually fits before it is reused,
+          so a near-paraphrase with different intent is not served the wrong
+          answer.  A hit short-circuits retrieval entirely.
+  Tier 1  Grounded RAG — the hybrid-retrieval + feedback loop above.  Used when
+          the corpus can answer the question (context relevance ≥ threshold).
+  Tier 2  LLM fallback — when retrieval cannot find relevant-enough context, the
+          question is answered from the model's own (parametric) knowledge with
+          NO corpus context.  The answer is flagged source="model_knowledge"
+          (it is ungrounded by construction, so faithfulness is not scored) and
+          written back to 'qa_cache' so a future similar question hits Tier 0.
+
+The 'qa_cache' collection is kept PHYSICALLY SEPARATE from the document
+collection on purpose: cached LLM answers are unverified, and blending them into
+document retrieval would let a hallucination be retrieved and cited as if it
+were source material.  ingest_pdf.py owns 'hybrid_rag_docs' and never sees the
+cache; this script owns 'qa_cache' and never writes to 'hybrid_rag_docs'.
+
 Ingestion is handled separately by ingest_pdf.py, which populates the
 collection with chunked, embedded PDF content:
 
@@ -76,6 +98,7 @@ import json
 import logging
 import os
 import sys
+from datetime import datetime, timezone
 
 # Windows terminals default to cp1252 which can't encode Haystack's emoji output.
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
@@ -136,13 +159,18 @@ LANGFUSE_ENABLED = enable_langfuse("hybrid_rag_query")
 
 from haystack import Document, Pipeline
 from haystack.components.builders import PromptBuilder
-from haystack.components.embedders import OpenAITextEmbedder
+from haystack.components.embedders import OpenAIDocumentEmbedder, OpenAITextEmbedder
 from haystack.components.evaluators import ContextRelevanceEvaluator, FaithfulnessEvaluator
 from haystack.components.generators.chat import OpenAIChatGenerator
+from haystack.components.writers import DocumentWriter
 from haystack.dataclasses import ChatMessage
+from haystack.document_stores.types import DuplicatePolicy
 from milvus_haystack import MilvusDocumentStore
 from milvus_haystack.function import BM25BuiltInFunction
-from milvus_haystack.milvus_embedding_retriever import MilvusHybridRetriever
+from milvus_haystack.milvus_embedding_retriever import (
+    MilvusEmbeddingRetriever,
+    MilvusHybridRetriever,
+)
 
 # ---------------------------------------------------------------------------
 # 1. Configuration
@@ -210,6 +238,47 @@ if doc_count == 0:
     sys.exit(1)
 log.info("Collection '%s' ready — %d chunks available", COLLECTION_NAME, doc_count)
 log.info("Langfuse tracing: %s", "enabled" if LANGFUSE_ENABLED else "disabled")
+
+# ---------------------------------------------------------------------------
+# 2b. Q&A semantic-cache store  (a SEPARATE collection — see module docstring)
+#     Holds prior Tier-2 LLM-fallback answers so a future similar question can
+#     be served without going to the LLM again.  Deliberately kept apart from
+#     the document collection so unverified cached answers can never leak into
+#     document retrieval and be cited as source material.
+#
+#     - dense-only: no BM25BuiltInFunction — cache matching is by question
+#       embedding similarity (paraphrase-robust), not keyword overlap.
+#     - COSINE index: makes the retriever's score an interpretable similarity
+#       in [0, 1] (milvus-haystack maps it as (cosine + 1) / 2, so 1.0 = the
+#       same question, 0.5 = orthogonal) — that's what CACHE_SIMILARITY_THRESHOLD
+#       is compared against below.
+#     - Strong consistency: read-your-writes within a single run, so a fallback
+#       answer written for one question is visible to a later similar one in the
+#       SAME run.  The cache is tiny, so the cost is negligible.
+#     A doc stores the QUESTION as its content (that's what we embed + match on);
+#     the answer rides along in meta["answer"].  The collection is created lazily
+#     on the first write — until then lookups find nothing (handled gracefully).
+# ---------------------------------------------------------------------------
+
+QA_CACHE_COLLECTION = "qa_cache"
+
+qa_cache_store = MilvusDocumentStore(
+    connection_args={"uri": MILVUS_URI},
+    collection_name=QA_CACHE_COLLECTION,
+    vector_field="vector",
+    text_field="text",
+    index_params={"index_type": "AUTOINDEX", "metric_type": "COSINE"},
+    consistency_level="Strong",
+    drop_old=False,  # cache persists across runs — never drop it
+)
+
+try:
+    cache_count = qa_cache_store.count_documents()
+except Exception:
+    # Collection doesn't exist yet (no fallback has ever been cached).  It will
+    # be created on the first write_documents() in store_in_cache().
+    cache_count = 0
+log.info("Q&A cache '%s' ready — %d cached answer(s)", QA_CACHE_COLLECTION, cache_count)
 
 # ---------------------------------------------------------------------------
 # 3. RAG Prompt Template
@@ -283,6 +352,57 @@ Question: {{ question }}
 """.strip()
 
 # ---------------------------------------------------------------------------
+# 3c. Cache-gate Prompt Template  (Tier 0)
+#     A high vector-similarity score only says two questions are CLOSE, not that
+#     they mean the same thing ("advantages of X" vs "disadvantages of X" embed
+#     very near each other).  Before reusing a cached answer we ask an LLM to
+#     confirm the cached answer genuinely and fully answers the NEW question.
+#     Returns strict JSON so the decision is deterministic in Python.
+# ---------------------------------------------------------------------------
+
+CACHE_GATE_TEMPLATE = """
+You are validating a cache hit for a question-answering system. We retrieved a
+previously-answered question whose wording is similar to a new question. Decide
+whether the CACHED ANSWER below fully and correctly answers the NEW QUESTION.
+
+Say "applies": true ONLY if the cached answer addresses exactly what the new
+question asks. If the new question asks about a different aspect, entity, scope,
+polarity (e.g. advantages vs disadvantages), or level of detail — even if the
+wording is close — say "applies": false.
+
+Cached question: {{ cached_question }}
+Cached answer: {{ cached_answer }}
+
+New question: {{ question }}
+
+Respond with ONLY a JSON object, no prose, in this exact shape:
+{
+  "applies": true | false,
+  "reason": "<one short sentence>"
+}
+""".strip()
+
+# ---------------------------------------------------------------------------
+# 3d. Fallback Prompt Template  (Tier 2 — answer from the model's own knowledge)
+#     Used only when hybrid retrieval cannot surface relevant-enough context.
+#     There is intentionally NO corpus context here: the answer comes from the
+#     model's parametric knowledge, so it is ungrounded by construction (we mark
+#     it source="model_knowledge" and skip faithfulness scoring).  We still ask
+#     the model to flag uncertainty rather than invent specifics.
+# ---------------------------------------------------------------------------
+
+FALLBACK_PROMPT_TEMPLATE = """
+You are a helpful assistant. The document collection did not contain enough
+information to answer the question below, so answer it from your own general
+knowledge as accurately as you can. If you are unsure or the question needs
+information you don't reliably have, say so plainly rather than inventing
+specifics.
+
+Question: {{ question }}
+Answer:
+""".strip()
+
+# ---------------------------------------------------------------------------
 # 4. Pipelines
 #
 #    The flow now branches on query quality, so it no longer fits a single
@@ -309,6 +429,14 @@ RETRIEVER_TOP_K = 4
 MAX_CONTEXT_DOCS = 8
 # Hard cap on sub-queries the analyzer may request, as a cost/latency guard.
 MAX_SUBQUERIES = 4
+
+# ── Tier 0 semantic cache ────────────────────────────────────────────────────
+# Minimum mapped-COSINE similarity (see qa_cache_store: (cosine + 1) / 2, so this
+# is in [0, 1] with 1.0 = identical question) for a cached answer to even be
+# CONSIDERED.  Deliberately strict — it's only a cheap pre-filter; the LLM cache
+# gate (CACHE_GATE_TEMPLATE) makes the final reuse decision, so this just keeps
+# us from spending a gate call on questions that aren't plausibly the same.
+CACHE_SIMILARITY_THRESHOLD = 0.90
 
 # ── Retrieval feedback loop ──────────────────────────────────────────────────
 # After retrieving, ask() scores the merged context with the ContextRelevance
@@ -372,10 +500,75 @@ generation_pipeline.add_component(
 )
 generation_pipeline.connect("prompt_builder.prompt", "llm.messages")
 
-log.info("Pipelines wired (query analyzer → hybrid retrieval → generation)")
+# ── 4e. Cache lookup (Tier 0) — dense top-1 over the qa_cache collection ──────
+# Same embedding model as the document retriever so questions land in a
+# comparable space.  top_k=1: we only ever consider the single closest cached
+# question; the gate decides whether to actually reuse it.
+cache_lookup_pipeline = Pipeline()
+cache_lookup_pipeline.add_component(
+    "text_embedder",
+    OpenAITextEmbedder(model="text-embedding-3-small"),
+)
+cache_lookup_pipeline.add_component(
+    "retriever",
+    MilvusEmbeddingRetriever(document_store=qa_cache_store, top_k=1),
+)
+cache_lookup_pipeline.connect("text_embedder.embedding", "retriever.query_embedding")
+
+# ── 4f. Cache gate (Tier 0) — LLM confirms a cached answer fits the new query ─
+# response_format=json_object so check_cache_gate() can branch deterministically.
+cache_gate_pipeline = Pipeline()
+cache_gate_pipeline.add_component(
+    "prompt_builder",
+    PromptBuilder(
+        template=CACHE_GATE_TEMPLATE,
+        required_variables=["question", "cached_question", "cached_answer"],
+    ),
+)
+cache_gate_pipeline.add_component(
+    "llm",
+    OpenAIChatGenerator(
+        model="gpt-4o-mini",
+        generation_kwargs={"response_format": {"type": "json_object"}},
+    ),
+)
+cache_gate_pipeline.connect("prompt_builder.prompt", "llm.messages")
+
+# ── 4g. Fallback generation (Tier 2) — answer from the model's own knowledge ──
+fallback_pipeline = Pipeline()
+fallback_pipeline.add_component(
+    "prompt_builder",
+    PromptBuilder(template=FALLBACK_PROMPT_TEMPLATE, required_variables=["question"]),
+)
+fallback_pipeline.add_component(
+    "llm",
+    OpenAIChatGenerator(model="gpt-4o-mini"),
+)
+fallback_pipeline.connect("prompt_builder.prompt", "llm.messages")
+
+# ── 4h. Cache write (Tier 2 → Tier 0) — embed the question, store the answer ──
+# Mirrors ingest_pdf.py's indexing path: OpenAIDocumentEmbedder adds the dense
+# vector (over the QUESTION, which is the doc content), DocumentWriter upserts
+# into qa_cache.  This is what creates the qa_cache collection on first use.
+cache_write_pipeline = Pipeline()
+cache_write_pipeline.add_component(
+    "embedder",
+    OpenAIDocumentEmbedder(model="text-embedding-3-small", progress_bar=False),
+)
+cache_write_pipeline.add_component(
+    "writer",
+    DocumentWriter(document_store=qa_cache_store, policy=DuplicatePolicy.NONE),
+)
+cache_write_pipeline.connect("embedder.documents", "writer.documents")
+
+log.info(
+    "Pipelines wired (cache lookup → query analyzer → hybrid retrieval → "
+    "generation; LLM fallback + cache write)"
+)
 log.debug("Analyzer graph:\n%s", query_analyzer_pipeline)
 log.debug("Retrieval graph:\n%s", retrieval_pipeline)
 log.debug("Generation graph:\n%s", generation_pipeline)
+log.debug("Cache lookup graph:\n%s", cache_lookup_pipeline)
 
 # ── 4d. Quality evaluators (also drive the retrieval feedback loop) ──────────
 #   FaithfulnessEvaluator     — LLM checks whether every claim in the answer is
@@ -515,10 +708,13 @@ def merge_documents(doc_lists: list[list[Document]], max_docs: int) -> list[Docu
     return merged[:max_docs]
 
 
-def ask(question: str) -> tuple[str, list[Document], dict]:
+def retrieve_best_context(question: str) -> dict:
     """
-    Answer a single question with query-quality-driven branching plus a bounded
-    retrieval feedback loop.
+    Run the bounded retrieval feedback loop and return the best attempt's
+    context — WITHOUT generating an answer.  Split out from ask() so the
+    three-tier orchestrator (answer_question) can inspect the relevance score
+    and decide between a grounded answer and an LLM fallback before paying for
+    a generation call.
 
     Each attempt:
       1. analyze_query()         — refine a vague query / decompose a complex
@@ -531,18 +727,11 @@ def ask(question: str) -> tuple[str, list[Document], dict]:
       • MAX_RETRIEVAL_ATTEMPTS reached    (hard ceiling)
       • a retry returns the same chunks   (stable doc set — retrying won't help)
       • a retry gains ≤ MIN_GAIN          (plateau — converged)
-    Then ONE answer is generated from the best attempt's context (against the
-    ORIGINAL question).  It always terminates with an answer, even when the
-    threshold is never met — some questions simply have no strong supporting
-    docs in the corpus.
 
-    Returns (answer, best_docs, analysis).  The analysis dict carries the
-    winning classification/queries plus loop telemetry — attempts made, why the
-    loop stopped, and the final context_relevance (reused as a metric so it is
-    not recomputed in evaluate_groundedness).
+    Returns the winning attempt dict: classification, queries, reasoning, docs,
+    score (context_relevance), attempts, stop_reason.  It always returns a set
+    (possibly weak) — the caller decides whether it's strong enough to ground on.
     """
-    log.info("Question: %s", question)
-
     best: dict | None = None        # winning attempt: {classification, queries, reasoning, docs, score}
     feedback: str | None = None     # hint fed to the next analyze_query()
     prev_score: float | None = None
@@ -608,36 +797,221 @@ def ask(question: str) -> tuple[str, list[Document], dict]:
         log.info("Relevance %.3f < %.2f — refining the query and retrying", score, RELEVANCE_THRESHOLD)
 
     # best is never None: the loop runs at least once (MAX_RETRIEVAL_ATTEMPTS ≥ 1).
-    retrieved_docs = best["docs"]
     log.info(
         "Retrieval loop ended after %d attempt(s) — reason=%s, context_relevance=%.3f",
         attempt, stop_reason, best["score"],
     )
-    for i, doc in enumerate(retrieved_docs, start=1):
+    for i, doc in enumerate(best["docs"], start=1):
         src   = doc.meta.get("document_name", "?")
         pages = doc.meta.get("page_numbers", [])
-        score = f"{doc.score:.4f}" if doc.score is not None else "n/a"
+        doc_score = f"{doc.score:.4f}" if doc.score is not None else "n/a"
         preview = (doc.content or "")[:80].replace("\n", " ")
-        log.debug("  [%d] score=%s (%s p.%s) %s...", i, score, src, pages, preview)
+        log.debug("  [%d] score=%s (%s p.%s) %s...", i, doc_score, src, pages, preview)
 
-    # Generate one answer to the original question from the best context.
+    best["attempts"] = attempt
+    best["stop_reason"] = stop_reason
+    return best
+
+
+def generate_grounded_answer(question: str, docs: list[Document]) -> str:
+    """Generate one answer to *question* grounded ONLY on *docs* (Tier 1)."""
     generation = generation_pipeline.run(
-        {"prompt_builder": {"question": question, "documents": retrieved_docs}}
+        {"prompt_builder": {"question": question, "documents": docs}}
     )
     llm_replies: list[ChatMessage] = generation["llm"]["replies"]
     answer = llm_replies[0].text if llm_replies else "(no reply)"
-    log.info("Answer generated (%d chars)", len(answer))
+    log.info("Grounded answer generated (%d chars)", len(answer))
     log.debug("Answer:\n%s", answer)
+    return answer
 
+
+def ask(question: str) -> tuple[str, list[Document], dict]:
+    """
+    Grounded RAG answer (Tier 1 only): retrieve the best context, then generate
+    one answer from it.  Kept as a thin convenience wrapper around
+    retrieve_best_context() + generate_grounded_answer(); the full three-tier
+    flow (cache → RAG → LLM fallback) lives in answer_question().
+
+    Returns (answer, best_docs, analysis); analysis carries the winning
+    classification/queries plus loop telemetry and the final context_relevance.
+    """
+    log.info("Question: %s", question)
+    best = retrieve_best_context(question)
+    answer = generate_grounded_answer(question, best["docs"])
     analysis_result = {
         "classification":    best["classification"],
         "queries":           best["queries"],
         "reasoning":         best["reasoning"],
-        "attempts":          attempt,
-        "stop_reason":       stop_reason,
+        "attempts":          best["attempts"],
+        "stop_reason":       best["stop_reason"],
+        "context_relevance": best["score"],
+        "source":            "rag",
+    }
+    return answer, best["docs"], analysis_result
+
+
+# ---------------------------------------------------------------------------
+# 5a. Three-tier answering: semantic cache → grounded RAG → LLM fallback
+# ---------------------------------------------------------------------------
+
+def check_cache_gate(question: str, cached_question: str, cached_answer: str) -> bool:
+    """
+    LLM gate for a cache near-hit: does *cached_answer* genuinely answer
+    *question*?  A high embedding similarity only means the questions are close
+    in wording, not intent — this guards against serving the wrong cached answer
+    for a near-paraphrase (e.g. advantages vs disadvantages).  Any failure is
+    treated as "does not apply" so we fall through to a real answer.
+    """
+    try:
+        result = cache_gate_pipeline.run(
+            {
+                "prompt_builder": {
+                    "question": question,
+                    "cached_question": cached_question,
+                    "cached_answer": cached_answer,
+                }
+            }
+        )
+        data = json.loads(result["llm"]["replies"][0].text)
+        return bool(data.get("applies", False))
+    except Exception:
+        log.exception("Cache gate failed — treating the candidate as a miss")
+        return False
+
+
+def lookup_cache(question: str) -> dict | None:
+    """
+    Tier 0 — try to answer *question* from the qa_cache collection.
+
+    Embeds the question, finds the single nearest cached question, and reuses
+    its answer ONLY if (a) similarity ≥ CACHE_SIMILARITY_THRESHOLD and (b) the
+    LLM gate confirms the cached answer fits.  Returns
+    {answer, cached_question, similarity} on a confirmed hit, else None.
+
+    Never raises: if the cache collection doesn't exist yet (no fallback has
+    ever been written) or anything errors, it degrades to a miss so the grounded
+    path runs normally.
+    """
+    try:
+        result = cache_lookup_pipeline.run({"text_embedder": {"text": question}})
+        docs = result["retriever"]["documents"]
+    except Exception:
+        log.debug("Cache lookup skipped (collection not ready or error)", exc_info=True)
+        return None
+
+    if not docs:
+        return None
+
+    top = docs[0]
+    similarity = top.score or 0.0
+    cached_question = top.meta.get("question") or top.content or ""
+    cached_answer = top.meta.get("answer")
+
+    if not cached_answer or similarity < CACHE_SIMILARITY_THRESHOLD:
+        log.debug(
+            "Cache miss — best similarity %.3f < %.2f", similarity, CACHE_SIMILARITY_THRESHOLD
+        )
+        return None
+
+    if not check_cache_gate(question, cached_question, cached_answer):
+        log.info("Cache near-hit (sim=%.3f) rejected by gate: %r", similarity, cached_question)
+        return None
+
+    log.info("Cache HIT (sim=%.3f) — reusing the answer cached for %r", similarity, cached_question)
+    return {"answer": cached_answer, "cached_question": cached_question, "similarity": similarity}
+
+
+def generate_fallback_answer(question: str) -> str:
+    """Tier 2 — answer *question* from the model's own knowledge (no context)."""
+    generation = fallback_pipeline.run({"prompt_builder": {"question": question}})
+    replies: list[ChatMessage] = generation["llm"]["replies"]
+    answer = replies[0].text if replies else "(no reply)"
+    log.info("Fallback (model-knowledge) answer generated (%d chars)", len(answer))
+    log.debug("Fallback answer:\n%s", answer)
+    return answer
+
+
+def store_in_cache(question: str, answer: str) -> None:
+    """
+    Persist a Tier-2 fallback (question, answer) into qa_cache so a future
+    similar question hits Tier 0.  This is what lazily creates the qa_cache
+    collection on first use.  Never raises — a cache-write failure must not lose
+    the answer we just produced.
+    """
+    try:
+        doc = Document(
+            content=question,  # embedded + matched on; the answer rides in meta
+            meta={
+                "question": question,
+                "answer": answer,
+                "source": "llm_cache",
+                "cached_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        cache_write_pipeline.run({"embedder": {"documents": [doc]}})
+        log.info("Cached the fallback answer for future similar questions")
+    except Exception:
+        log.exception("Failed to write the fallback answer to qa_cache — continuing")
+
+
+def answer_question(question: str) -> tuple[str, list[Document], dict]:
+    """
+    Answer a question through the three tiers (see module docstring):
+
+      Tier 0  cache          — reuse a confirmed prior LLM-fallback answer
+      Tier 1  rag            — grounded answer when the corpus is relevant enough
+      Tier 2  model_knowledge— LLM fallback (no context) when it isn't, cached
+
+    Returns (answer, docs, analysis).  analysis["source"] records which tier
+    produced the answer so downstream evaluation/reporting can treat grounded
+    and ungrounded answers correctly (faithfulness is only meaningful for "rag").
+    For a cache hit, docs is empty; for a fallback, docs is the best (weak)
+    retrieved set, kept for transparency but not used to ground the answer.
+    """
+    log.info("Question: %s", question)
+
+    # ── Tier 0 — semantic cache ──────────────────────────────────────────────
+    cached = lookup_cache(question)
+    if cached is not None:
+        analysis = {
+            "source":            "cache",
+            "classification":    "cached",
+            "queries":           [],
+            "reasoning":         f"reused answer cached for {cached['cached_question']!r}",
+            "attempts":          0,
+            "stop_reason":       "cache_hit",
+            "context_relevance": None,
+            "cache_similarity":  cached["similarity"],
+            "cached_question":   cached["cached_question"],
+        }
+        return cached["answer"], [], analysis
+
+    # ── Tier 1 — grounded retrieval ──────────────────────────────────────────
+    best = retrieve_best_context(question)
+    analysis = {
+        "classification":    best["classification"],
+        "queries":           best["queries"],
+        "reasoning":         best["reasoning"],
+        "attempts":          best["attempts"],
+        "stop_reason":       best["stop_reason"],
         "context_relevance": best["score"],
     }
-    return answer, retrieved_docs, analysis_result
+
+    if best["score"] >= RELEVANCE_THRESHOLD:
+        analysis["source"] = "rag"
+        answer = generate_grounded_answer(question, best["docs"])
+        return answer, best["docs"], analysis
+
+    # ── Tier 2 — corpus can't answer it → LLM fallback, then cache it ────────
+    log.info(
+        "Context relevance %.3f < %.2f — the corpus can't answer this; "
+        "falling back to the LLM (no context) and caching the result",
+        best["score"], RELEVANCE_THRESHOLD,
+    )
+    analysis["source"] = "model_knowledge"
+    answer = generate_fallback_answer(question)
+    store_in_cache(question, answer)
+    return answer, best["docs"], analysis
 
 
 # ---------------------------------------------------------------------------
@@ -737,19 +1111,45 @@ def log_run_summary(results: list[dict]) -> None:
     for i, r in enumerate(results, start=1):
         m = r["metrics"]
         analysis = r.get("analysis") or {}
-        cls = analysis.get("classification", "n/a")
-        sub_queries = analysis.get("queries", [])
-        attempts = analysis.get("attempts", 1)
-        stop_reason = analysis.get("stop_reason", "n/a")
-        query_line = (
-            f"Query analysis: {cls} — searched {len(sub_queries)} "
-            f"query(ies) in {attempts} attempt(s) (stop: {stop_reason}): {sub_queries}"
-        )
+        source = analysis.get("source", "rag")
+
+        # The per-question header describes how the answer was produced — which
+        # of the three tiers fired (see answer_question).
+        if source == "cache":
+            query_line = (
+                f"Source: CACHE — reused a prior LLM-fallback answer "
+                f"(similarity={analysis.get('cache_similarity', 0.0):.3f}) cached for: "
+                f"{analysis.get('cached_question', '?')!r}"
+            )
+        elif source == "model_knowledge":
+            cr = analysis.get("context_relevance")
+            cr_txt = f"{cr:.3f}" if cr is not None else "n/a"
+            query_line = (
+                f"Source: MODEL KNOWLEDGE — LLM fallback (no corpus context; "
+                f"best context_relevance={cr_txt} < {RELEVANCE_THRESHOLD:.2f}); "
+                f"answer cached for future similar questions"
+            )
+        else:  # "rag"
+            cls = analysis.get("classification", "n/a")
+            sub_queries = analysis.get("queries", [])
+            attempts = analysis.get("attempts", 1)
+            stop_reason = analysis.get("stop_reason", "n/a")
+            query_line = (
+                f"Source: RAG — query analysis: {cls} — searched {len(sub_queries)} "
+                f"query(ies) in {attempts} attempt(s) (stop: {stop_reason}): {sub_queries}"
+            )
+
         if m is None:
+            # Not all None metrics are failures: cache hits and model-knowledge
+            # fallbacks are ungrounded by design, so groundedness is N/A.
+            metrics_note = (
+                "(not applicable — answer is not grounded in the corpus)"
+                if source != "rag"
+                else "(evaluation failed — see errors earlier in the run)"
+            )
             summary_log.info(
-                "[Q%d] %s\n%s\nAnswer:\n%s\n"
-                "Metrics: (evaluation failed — see errors earlier in the run)",
-                i, r["question"], query_line, r["answer"],
+                "[Q%d] %s\n%s\nAnswer:\n%s\nMetrics: %s",
+                i, r["question"], query_line, r["answer"], metrics_note,
             )
             continue
         summary_log.info(
@@ -767,10 +1167,16 @@ def log_run_summary(results: list[dict]) -> None:
     all_metrics = [r["metrics"] for r in results if r["metrics"] is not None]
     k = len(all_metrics)
     if k == 0:
-        summary_log.warning("No successful evaluations — metrics table skipped.")
+        summary_log.warning(
+            "No grounded (RAG) answers to score — metrics table skipped "
+            "(all answers came from cache or LLM fallback)."
+        )
         return
     if k < n:
-        summary_log.warning("Metrics table covers %d of %d queries (evaluation failures).", k, n)
+        summary_log.warning(
+            "Metrics table covers %d of %d queries — the rest were answered from "
+            "cache or LLM fallback (ungrounded), or failed evaluation.", k, n
+        )
     avg_faithfulness      = sum(m["faithfulness"]        for m in all_metrics) / k
     avg_context_relevance = sum(m["context_relevance"]   for m in all_metrics) / k
     avg_retrieval_score   = sum(m["avg_retrieval_score"] for m in all_metrics) / k
@@ -831,23 +1237,33 @@ if __name__ == "__main__":
     for i, q in enumerate(questions, start=1):
         log.info("── Query %d/%d ──", i, len(questions))
         try:
-            answer, docs, analysis = ask(q)
+            answer, docs, analysis = answer_question(q)
         except Exception:
             log.exception("Query %d/%d failed — skipping it", i, len(questions))
             continue
-        # An evaluation failure (e.g. an OpenAI timeout in the gpt-5-mini
-        # evaluators) must not lose the whole run — keep the answer,
+        # Groundedness only makes sense for a grounded (Tier-1 "rag") answer.
+        # Cache hits and Tier-2 LLM fallbacks have no corpus context to be
+        # faithful to, so they are reported as "not applicable" rather than
+        # scored.  An evaluation failure (e.g. an OpenAI timeout in the
+        # gpt-5-mini evaluators) must not lose the whole run — keep the answer,
         # mark metrics as unavailable, and carry on.
-        try:
-            metrics = evaluate_groundedness(
-                q, answer, docs, context_relevance=analysis["context_relevance"]
-            )
-        except Exception:
-            log.exception(
-                "Evaluation for query %d/%d failed — keeping the answer without metrics",
-                i, len(questions),
+        if analysis["source"] != "rag":
+            log.info(
+                "Query %d/%d answered via '%s' — skipping groundedness evaluation",
+                i, len(questions), analysis["source"],
             )
             metrics = None
+        else:
+            try:
+                metrics = evaluate_groundedness(
+                    q, answer, docs, context_relevance=analysis["context_relevance"]
+                )
+            except Exception:
+                log.exception(
+                    "Evaluation for query %d/%d failed — keeping the answer without metrics",
+                    i, len(questions),
+                )
+                metrics = None
         results.append(
             {"question": q, "answer": answer, "metrics": metrics, "analysis": analysis}
         )

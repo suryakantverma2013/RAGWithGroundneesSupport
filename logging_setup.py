@@ -36,6 +36,7 @@ import argparse
 import logging
 import sys
 import time
+import warnings
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -66,6 +67,18 @@ NOISY_LOGGERS = (
 # library-internal advisory, not anything from our pipelines.
 QUIET_LOGGERS = (
     "haystack.components.builders.prompt_builder",
+)
+
+# Warning-message patterns (regex, matched from the start) silenced outright via
+# the `warnings` filter — distinct from the loggers above: these are issued by
+# the `warnings` module, not `logging`, and are non-actionable from our code.
+#   • milvus-haystack still calls the older ORM-style pymilvus API internally
+#     (utility.has_collection, Collection, Index.to_dict, …); every store init
+#     therefore emits a handful of PyMilvusDeprecationWarnings we can't fix here.
+# Matched on message text (not the category class) so this module needn't import
+# pymilvus, which would pull heavy deps in before the scripts' own imports.
+SUPPRESSED_WARNINGS = (
+    r".*ORM-style PyMilvus API.*",
 )
 
 
@@ -169,10 +182,16 @@ def setup_logging(
     for quiet in QUIET_LOGGERS:
         logging.getLogger(quiet).setLevel(logging.ERROR)
 
-    # Route Python `warnings` (e.g. PyMilvusDeprecationWarning raised inside
-    # milvus_haystack — not actionable from our code) through logging instead
-    # of raw stderr: with --log-dest file they land in the log file and the
-    # console stays clean; nothing is suppressed outright.
+    # Drop known non-actionable warnings (see SUPPRESSED_WARNINGS) BEFORE
+    # captureWarnings: an "ignore" filter prevents the warning from being issued
+    # at all, so it never reaches the py.warnings logger.  Inserted at the front
+    # of the filter list, these take precedence over the default filters.
+    for pattern in SUPPRESSED_WARNINGS:
+        warnings.filterwarnings("ignore", message=pattern)
+
+    # Route the REMAINING Python `warnings` through logging instead of raw
+    # stderr: with --log-dest file they land in the log file and the console
+    # stays clean.  Anything not matched above is still surfaced, just tidily.
     logging.captureWarnings(True)
 
     return log_path
